@@ -11,6 +11,7 @@ class MusicPlayer:
         self.queue = asyncio.Queue()
         self.next = asyncio.Event()
         self.voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+        self.volume = 1.0
 
         bot.loop.create_task(self.player_loop())
 
@@ -22,7 +23,7 @@ class MusicPlayer:
             url = await self.queue.get()
             YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist':'True'}
             FFMPEG_OPTIONS = {
-                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
+                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': f'-vn -af "volume={self.volume}"'}
             with YoutubeDL(YDL_OPTIONS) as ydl:
                 info = ydl.extract_info(url, download=False)
             URL = info['formats'][0]['url']
@@ -59,5 +60,11 @@ async def skip(ctx):
 async def stop(ctx):
     voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     voice.stop()
+
+@bot.command(name='volume')
+async def volume(ctx, vol: float):
+    if ctx.guild.id in players:
+        player = players[ctx.guild.id]
+        player.volume = vol
 
 bot.run('YOUR_TOKEN_HERE')
