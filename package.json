@@ -1,0 +1,28 @@
+{
+  "name": "discord-music-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --max-old-space-size=4096 index.js",
+    "dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@discordjs/voice": "^0.18.0",
+    "@distube/ytdl-core": "^4.16.12",
+    "@distube/ytsr": "^2.0.4",
+    "discord.js": "^14.21.0",
+    "opusscript": "^0.0.8",
+    "play-dl": "^1.9.7",
+    "sodium-native": "^5.0.6",
+    "youtube-sr": "^4.3.12",
+    "yt-dlp-wrap": "^2.3.12"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
