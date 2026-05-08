@@ -2,7 +2,7 @@
 # Node JS Discord Music Bot Setup
 
 This guide walks you through installing the necessary packages to run a high-performance Discord music bot using Node.js.
-## 📦 Installation
+## Installation
 Run the following commands in your bot's root directory:
 
 ### Core Dependencies
@@ -19,7 +19,7 @@ npm install tweetnacl (not tested)
 Correct file structure:
 discord-music-bot/
 │
-├── node_modules/       ← Never create or edit files here
+├── node_modules/       
 │   └── (all the installed packages)
 │
 ├── index.js           ← CREATE YOUR FILE HERE
