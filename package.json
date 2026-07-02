@@ -1,28 +1,28 @@
 {
-  "name": "discord-music-bot",
+  "name": "discord-music-bot-lavalink",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Discord music bot using Lavalink for audio streaming",
+  "main": "bot.js",
   "scripts": {
-    "start": "node --max-old-space-size=4096 index.js",
-    "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "discord",
+    "music",
+    "bot",
+    "lavalink"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
-    "@discordjs/voice": "^0.18.0",
-    "@distube/ytdl-core": "^4.16.12",
-    "@distube/ytsr": "^2.0.4",
-    "discord.js": "^14.21.0",
-    "opusscript": "^0.0.8",
-    "play-dl": "^1.9.7",
-    "sodium-native": "^5.0.6",
-    "youtube-sr": "^4.3.12",
-    "yt-dlp-wrap": "^2.3.12"
+    "discord.js": "^14.14.1",
+    "shoukaku": "^4.2.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }

@@ -1,0 +1,9 @@
+node_modules/
+.env
+cookies.txt
+audio_cache/
+logs/
+*.log
+*.backup*
+LavaLink/Lavalink.jar
+plugins/

@@ -1,0 +1,27 @@
+[Unit]
+Description=Discord Music Bot (node)
+After=lavalink.service network-online.target
+Requires=lavalink.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=m0nk
+WorkingDirectory=/home/m0nk/Discord-Music-Bot
+EnvironmentFile=/home/m0nk/Discord-Music-Bot/.env
+Environment=PATH=/home/m0nk/.local/bin:/home/m0nk/.deno/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_ENV=production
+# Wait up to 60s for Lavalink HTTP /version to return 200 before starting bot.
+ExecStartPre=/bin/bash -c 'for i in {1..60}; do curl -fsS -H "Authorization: youshallnotpass" http://localhost:2333/version >/dev/null 2>&1 && exit 0; sleep 1; done; echo "Lavalink did not become healthy within 60s" >&2; exit 1'
+ExecStart=/usr/bin/node bot.js
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=append:/home/m0nk/Discord-Music-Bot/logs/bot.log
+StandardError=append:/home/m0nk/Discord-Music-Bot/logs/bot.log
+SyslogIdentifier=musicbot
+
+[Install]
+WantedBy=multi-user.target

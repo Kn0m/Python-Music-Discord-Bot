@@ -1,0 +1,9 @@
+/home/m0nk/Discord-Music-Bot/logs/bot.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
