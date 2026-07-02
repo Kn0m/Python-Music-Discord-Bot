@@ -73,3 +73,5 @@ None of the heavy lifting here is mine — this bot is mostly glue around other 
 - [Deno](https://deno.com) — the JS runtime yt-dlp uses to solve YouTube's PO token challenges
 
 Earlier versions were built on [@distube/ytdl-core](https://github.com/distubejs/ytdl-core) and play-dl, which served well until YouTube's 2026 cipher changes forced the move to yt-dlp.
+
+Honesty note: a good chunk of this — the yt-dlp migration, the reliability work, and the debugging every time YouTube broke something — was pair-programmed with [Claude](https://claude.com) (Anthropic's AI). Every fix in here that looks suspiciously well-commented, that's why.
