@@ -33,7 +33,7 @@ const YTDLP_PLAYER_CLIENTS = 'default,tv,mweb,web_embedded';
 const LavalinkConfig = [
     {
         name: 'Lavalink',
-        url: 'localhost:2333',
+        url: '127.0.0.1:2333',
         auth: 'youshallnotpass',
         secure: false
     }
