@@ -60,3 +60,16 @@ Two patches have to be reapplied to `node_modules/shoukaku/dist/index.js` after 
 - If every video suddenly only returns storyboard formats, yt-dlp stable has rotted again. Move to nightly: `pip3 install --break-system-packages --upgrade --pre 'yt-dlp[default]'`
 
 The old play-dl version of this bot is in the git history if anyone wants it.
+
+## Credits
+
+None of the heavy lifting here is mine — this bot is mostly glue around other people's excellent work:
+
+- [Lavalink](https://github.com/lavalink-devs/Lavalink) — the audio server doing the actual streaming
+- [Shoukaku](https://github.com/shipgirlproject/Shoukaku) by Deivu — the Lavalink client the bot talks through
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — carrying the entire "play YouTube audio in 2026" problem on its back
+- [discord.js](https://discord.js.org) — the Discord API library
+- [youtube-source](https://github.com/lavalink-devs/youtube-source) — Lavalink's YouTube plugin
+- [Deno](https://deno.com) — the JS runtime yt-dlp uses to solve YouTube's PO token challenges
+
+Earlier versions were built on [@distube/ytdl-core](https://github.com/distubejs/ytdl-core) and play-dl, which served well until YouTube's 2026 cipher changes forced the move to yt-dlp.

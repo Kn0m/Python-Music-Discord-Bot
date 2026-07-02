@@ -13,7 +13,7 @@
     "lavalink"
   ],
   "author": "Kn0m",
-  "license": "MIT",
+  "license": "CC0-1.0",
   "dependencies": {
     "discord.js": "^14.14.1",
     "shoukaku": "^4.2.0"
