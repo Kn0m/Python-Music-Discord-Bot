@@ -1,0 +1,9 @@
+[Unit]
+Description=Update yt-dlp nightly channel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=m0nk
+ExecStart=/usr/bin/pip3 install --break-system-packages --upgrade --pre yt-dlp[default]

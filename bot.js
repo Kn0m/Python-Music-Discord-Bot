@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { Shoukaku, Connectors } = require('shoukaku');
+const { Shoukaku, Connectors, Constants } = require('shoukaku');
+const { State } = Constants;
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
@@ -12,16 +13,24 @@ if (!TOKEN) {
     console.error('[fatal] DISCORD_TOKEN not set in environment. Aborting.');
     process.exit(1);
 }
-const PREFIX = '.';
-const YTDLP_PATH = '/home/m0nk/.local/bin/yt-dlp';
-const AUDIO_CACHE = '/home/m0nk/Discord-Music-Bot/audio_cache';
-const COOKIES_PATH = '/home/m0nk/Discord-Music-Bot/cookies.txt';
+// Paths and connection settings are overridable via .env so the bot isn't
+// welded to one machine's layout.
+const PREFIX = process.env.BOT_PREFIX || '.';
+const YTDLP_PATH = process.env.YTDLP_PATH || '/home/m0nk/.local/bin/yt-dlp';
+const AUDIO_CACHE = process.env.AUDIO_CACHE_DIR || '/home/m0nk/Discord-Music-Bot/audio_cache';
+const COOKIES_PATH = process.env.COOKIES_PATH || '/home/m0nk/Discord-Music-Bot/cookies.txt';
+const DENO_BIN_DIR = process.env.DENO_BIN_DIR || '/home/m0nk/.deno/bin';
 
 // Timeouts and intervals (named constants)
 const YTDLP_META_TIMEOUT_MS = 30000;
 const YTDLP_DL_TIMEOUT_MS = 60000;
 const IDLE_TIMEOUT = 60000;
 const CACHE_CLEAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const CACHE_MAX_FILES = 20;
+const CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500 MB - count cap alone doesn't bound disk use
+// If Lavalink is down this long, exit and let systemd restart the whole stack
+// (musicbot.service Requires=lavalink.service, so the restart revives both).
+const LAVALINK_DEAD_EXIT_MS = 3 * 60 * 1000;
 
 // yt-dlp client fallback list - order matters (first to succeed wins).
 // Includes default (android_vr, web_safari), then a curated set of known-good fallbacks.
@@ -33,8 +42,8 @@ const YTDLP_PLAYER_CLIENTS = 'default,tv,mweb,web_embedded';
 const LavalinkConfig = [
     {
         name: 'Lavalink',
-        url: '127.0.0.1:2333',
-        auth: 'youshallnotpass',
+        url: process.env.LAVALINK_URL || '127.0.0.1:2333',
+        auth: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
         secure: false
     }
 ];
@@ -61,6 +70,17 @@ const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), LavalinkConfig, 
 // Queue storage
 const queues = new Map();
 const disconnectTimeouts = new Map();
+
+// Per-guild command serialization. Two near-simultaneous .play commands used to both
+// see playing=false and the second track silently replaced (lost) the first. The lock
+// makes queue mutations run one at a time per guild; yt-dlp resolution stays parallel.
+const guildLocks = new Map();
+function withGuildLock(guildId, fn) {
+    const prev = guildLocks.get(guildId) || Promise.resolve();
+    const run = prev.then(fn, fn);
+    guildLocks.set(guildId, run.then(() => {}, () => {}));
+    return run;
+}
 
 // In-flight yt-dlp downloads, keyed by safeTitle (video id), to dedupe simultaneous .play
 // requests for the same URL. Each value is a Promise that resolves to the same result the
@@ -111,7 +131,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Build env with deno on PATH for PO token solving.
 function ytdlpEnv() {
-    return Object.assign({}, process.env, { PATH: '/home/m0nk/.deno/bin:' + (process.env.PATH || '') });
+    return Object.assign({}, process.env, { PATH: DENO_BIN_DIR + ':' + (process.env.PATH || '') });
 }
 
 // Optional cookies arg pair -- only included if cookies.txt exists. Lets the bot play
@@ -313,6 +333,15 @@ const inUseFiles = new Set();
 function markInUse(p) { if (p) inUseFiles.add(p); }
 function markFree(p) { if (p) inUseFiles.delete(p); }
 
+// Free every file a session was holding. Must be called on ALL session-teardown paths
+// (.stop, .dc, idle disconnect) or the current song's file stays in inUseFiles forever
+// and becomes permanently exempt from cache cleanup.
+function releaseQueueFiles(queue) {
+    if (!queue) return;
+    if (queue.currentSong) markFree(queue.currentSong.localFile);
+    for (const s of queue.songs) markFree(s.localFile);
+}
+
 // Clean up old cached audio files (keep last 20 by mtime), excluding currently-playing files
 // and queued upcoming files. Also sweeps stray .webm/.part/.tmp-* postproc remnants regardless
 // of count (those are always junk).
@@ -338,13 +367,26 @@ function cleanAudioCache() {
         }
 
         const remaining = fs.readdirSync(AUDIO_CACHE)
-            .map(f => ({ name: f, full: path.join(AUDIO_CACHE, f), time: fs.statSync(path.join(AUDIO_CACHE, f)).mtimeMs }))
+            .map(f => {
+                const full = path.join(AUDIO_CACHE, f);
+                const st = fs.statSync(full);
+                return { name: f, full: full, time: st.mtimeMs, size: st.size };
+            })
             .filter(o => !protectedSet.has(o.full))
             .sort((a, b) => b.time - a.time);
 
-        // Keep the 20 newest unprotected files; delete the rest.
-        for (const f of remaining.slice(20)) {
-            try { fs.unlinkSync(f.full); } catch (_) {}
+        // Keep the newest unprotected files up to both the count cap and the byte cap;
+        // delete the rest. Count alone doesn't bound disk use (20 DJ sets is gigabytes).
+        let kept = 0;
+        let keptBytes = 0;
+        for (const f of remaining) {
+            const size = f.size || 0;
+            if (kept < CACHE_MAX_FILES && keptBytes + size <= CACHE_MAX_BYTES) {
+                kept++;
+                keptBytes += size;
+            } else {
+                try { fs.unlinkSync(f.full); } catch (_) {}
+            }
         }
     } catch (e) {
         logWarn('cleanAudioCache error: ' + e.message);
@@ -371,8 +413,56 @@ function createQueue(guildId) {
         loop: false,
         loopQueue: false,
         playing: false,
+        paused: false,
+        skipNext: false,
         currentSong: null
     };
+}
+
+// Attach the full set of player event handlers exactly once per player. The .play and
+// .playfrom handlers used to wire these inline with copy-pasted (and drifted) versions --
+// the .playfrom copy was missing the 'stuck' handler entirely.
+function attachPlayerEvents(guildId, queue) {
+    queue.player.on('start', () => {
+        logInfo('Track started');
+    });
+
+    queue.player.on('end', async (data) => {
+        const reason = data && data.reason;
+        logInfo('Track ended' + (reason ? ' (reason: ' + reason + ')' : ''));
+        if (reason === 'replaced') return;
+        try { await playNext(guildId); } catch (e) { logError('playNext error: ' + e); }
+    });
+
+    queue.player.on('exception', (data) => {
+        logError('Track exception: ' + JSON.stringify(data));
+        queue.textChannel.send('❌ An error occurred while playing!').catch(() => {});
+        playNext(guildId).catch(e => logError('playNext error: ' + e));
+    });
+
+    queue.player.on('stuck', (data) => {
+        logError('Track stuck: ' + JSON.stringify(data));
+        queue.textChannel.send('❌ Track stuck, skipping...').catch(() => {});
+        playNext(guildId).catch(e => logError('playNext error: ' + e));
+    });
+}
+
+function buildNowPlayingEmbed(song) {
+    if (song.startTime) {
+        return new EmbedBuilder()
+            .setTitle('🎵 Now Playing')
+            .setDescription('**[' + song.title + '](' + song.uri + ')**')
+            .addFields([
+                { name: '⏰ Starting at', value: '`' + formatTime(song.startTime) + '`', inline: true },
+                { name: '⏱️ Playing for', value: '`' + formatTime(song.duration) + '`', inline: true },
+                { name: '👤 Requested by', value: song.requestedBy, inline: true }
+            ])
+            .setThumbnail(song.thumbnail)
+            .setColor('#FF0000')
+            .setFooter({ text: 'Powered by Lavalink + yt-dlp' })
+            .setTimestamp();
+    }
+    return createSongEmbed(song, '🎵 Now Playing');
 }
 
 function createSongEmbed(song, title) {
@@ -421,6 +511,7 @@ function scheduleDisconnect(guildId) {
             if (queue.textChannel) {
                 await queue.textChannel.send('👋 Disconnected due to inactivity');
             }
+            releaseQueueFiles(queue);
             if (queue.player) queue.player.stopTrack();
             shoukaku.leaveVoiceChannel(guildId);
 
@@ -437,6 +528,7 @@ function scheduleDisconnect(guildId) {
             logInfo('Auto-disconnected from guild ' + guildId);
         } catch (error) {
             logError('Error during auto-disconnect: ' + (error && error.stack ? error.stack : error));
+            releaseQueueFiles(queue);
             queues.delete(guildId);
             disconnectTimeouts.delete(guildId);
         }
@@ -457,7 +549,11 @@ async function playNext(guildId) {
     const queue = queues.get(guildId);
     if (!queue || !queue.player) return;
 
-    if (queue.loop && queue.currentSong) {
+    // .skip sets skipNext so a looped track actually advances instead of replaying.
+    const skipRequested = queue.skipNext;
+    queue.skipNext = false;
+
+    if (queue.loop && queue.currentSong && !skipRequested) {
         await playSong(guildId, queue.currentSong);
         return;
     }
@@ -483,7 +579,7 @@ async function playNext(guildId) {
     await playSong(guildId, song);
 }
 
-async function playSong(guildId, song) {
+async function playSong(guildId, song, suppressAnnounce = false) {
     const queue = queues.get(guildId);
     if (!queue || !queue.player) return;
 
@@ -528,7 +624,7 @@ async function playSong(guildId, song) {
             markInUse(localFile);
 
             // Load the local file through Lavalink
-            const node = [...shoukaku.nodes.values()].find(n => n.state === 1);
+            const node = [...shoukaku.nodes.values()].find(n => n.state === State.CONNECTED);
             if (!node) {
                 await queue.textChannel.send('❌ Lavalink not connected!');
                 return;
@@ -536,15 +632,31 @@ async function playSong(guildId, song) {
 
             logInfo('Loading local file: ' + localFile);
             const localResult = await node.rest.resolve(localFile);
-            if (!localResult || !localResult.data || localResult.loadType === 'error' || localResult.loadType === 'empty') {
+
+            // Explicit loadType switch (Lavalink v4 lowercase enum) instead of relying on
+            // the data shape falling through correctly by accident.
+            let localTrack = null;
+            switch (localResult && localResult.loadType) {
+                case 'track':
+                    localTrack = localResult.data;
+                    break;
+                case 'search':
+                case 'playlist':
+                    localTrack = Array.isArray(localResult.data) ? localResult.data[0]
+                               : (localResult.data && localResult.data.tracks ? localResult.data.tracks[0] : null);
+                    break;
+                case 'error':
+                case 'empty':
+                default:
+                    localTrack = null;
+            }
+
+            if (!localTrack || !localTrack.encoded) {
                 logError('Lavalink local load failed: ' + JSON.stringify(localResult));
                 await queue.textChannel.send('❌ Lavalink could not load the audio file!');
                 await playNext(guildId);
                 return;
             }
-
-            const localTrack = localResult.loadType === 'track' ? localResult.data :
-                              (Array.isArray(localResult.data) ? localResult.data[0] : localResult.data);
             encoded = localTrack.encoded;
             logInfo('Local file loaded successfully');
             // Don't call cleanAudioCache here -- the periodic interval handles it, plus
@@ -560,22 +672,11 @@ async function playSong(guildId, song) {
 
         await queue.player.playTrack(playOptions);
 
-        const embed = song.startTime
-            ? new EmbedBuilder()
-                .setTitle('🎵 Now Playing')
-                .setDescription('**[' + song.title + '](' + song.uri + ')**')
-                .addFields([
-                    { name: '⏰ Starting at', value: '`' + formatTime(song.startTime) + '`', inline: true },
-                    { name: '⏱️ Playing for', value: '`' + formatTime(song.duration) + '`', inline: true },
-                    { name: '👤 Requested by', value: song.requestedBy, inline: true }
-                ])
-                .setThumbnail(song.thumbnail)
-                .setColor('#FF0000')
-                .setFooter({ text: 'Powered by Lavalink + yt-dlp' })
-                .setTimestamp()
-            : createSongEmbed(song, '🎵 Now Playing');
-
-        await queue.textChannel.send({ embeds: [embed] });
+        // The .play/.playfrom handlers announce the first track by editing their
+        // placeholder message; announcing here too produced duplicate embeds.
+        if (!suppressAnnounce) {
+            await queue.textChannel.send({ embeds: [buildNowPlayingEmbed(song)] });
+        }
     } catch (error) {
         logError('Error playing song: ' + (error && error.stack ? error.stack : error));
         await queue.textChannel.send('❌ Error playing song!');
@@ -594,26 +695,49 @@ client.once('ready', () => {
     startCacheCleanInterval();
 });
 
+// Self-heal: Shoukaku gives up after reconnectTries and the bot would otherwise sit
+// zombie forever ("Lavalink is still connecting..." on every command). If Lavalink stays
+// down past the deadline, exit(1) -- systemd's Restart=on-failure + Requires=lavalink
+// brings the whole stack back up cleanly.
+let lavalinkDeadTimer = null;
+function armLavalinkDeadTimer() {
+    if (lavalinkDeadTimer) return;
+    lavalinkDeadTimer = setTimeout(() => {
+        logError('Lavalink has been down for ' + (LAVALINK_DEAD_EXIT_MS / 1000) + 's; exiting so systemd can restart the stack.');
+        process.exit(1);
+    }, LAVALINK_DEAD_EXIT_MS);
+}
+function disarmLavalinkDeadTimer() {
+    if (lavalinkDeadTimer) {
+        clearTimeout(lavalinkDeadTimer);
+        lavalinkDeadTimer = null;
+    }
+}
+
 // Shoukaku events
 shoukaku.on('ready', (name) => {
     logInfo('Lavalink ' + name + ' is ready!');
     logInfo('Bot is now fully operational and ready to play music!');
     lavalinkReady = true;
+    disarmLavalinkDeadTimer();
 });
 
 shoukaku.on('error', (name, error) => {
     logError('Lavalink node ' + name + ' error: ' + (error && error.stack ? error.stack : error));
     lavalinkReady = false;
+    armLavalinkDeadTimer();
 });
 
 shoukaku.on('close', (name, code, reason) => {
     logInfo('Lavalink node ' + name + ' closed: ' + code + ' - ' + reason);
     lavalinkReady = false;
+    armLavalinkDeadTimer();
 });
 
 shoukaku.on('disconnect', (name, count) => {
     logInfo('Lavalink node ' + name + ' disconnected. Reconnect attempts: ' + count);
     lavalinkReady = false;
+    armLavalinkDeadTimer();
 });
 
 // Map common yt-dlp stderr substrings to friendlier user messages.
@@ -621,11 +745,11 @@ function friendlyYtdlpReason(reason) {
     if (!reason) return 'Could not find that song!';
     const r = reason.toLowerCase();
     if (r.includes('drm protected')) return 'YouTube refused this video (DRM/Made-for-Kids restriction).';
-    if (r.includes('please sign in') || r.includes('sign in')) return 'YouTube requires sign-in for this video. Bot has no cookies configured.';
+    if (r.includes('please sign in') || r.includes('sign in')) return 'YouTube requires sign-in for this video. The bot\'s cookies.txt may be missing or expired.';
     if (r.includes('video is not available')) return 'YouTube reports this video is not available (region/Made-for-Kids/private).';
     if (r.includes('format is not available')) return 'No audio format available for this video.';
     if (r.includes('private video')) return 'This video is private.';
-    if (r.includes('age')) return 'This video is age-restricted; bot has no cookies configured.';
+    if (r.includes('age')) return 'This video is age-restricted; the bot\'s cookies.txt may be missing or expired.';
     if (r.includes('removed') || r.includes('terminated')) return 'This video has been removed.';
     if (r.includes('unavailable')) return 'This video is unavailable.';
     // Fallback - show the first line of the actual yt-dlp error so the owner can debug.
@@ -700,7 +824,7 @@ client.on('messageCreate', async (message) => {
         const placeholder = await message.reply('🔍 Searching...');
 
         try {
-            const node = [...shoukaku.nodes.values()].find(node => node.state === 1);
+            const node = [...shoukaku.nodes.values()].find(node => node.state === State.CONNECTED);
             if (!node) {
                 return placeholder.edit('❌ Lavalink node is not connected! Please wait a moment and try again.');
             }
@@ -728,66 +852,48 @@ client.on('messageCreate', async (message) => {
                 videoId: ytInfo.videoId
             };
 
-            let queue = queues.get(message.guild.id);
-            if (!queue) {
-                queue = createQueue(message.guild.id);
-                queue.textChannel = message.channel;
-                queue.voiceChannel = message.member.voice.channel;
-                queues.set(message.guild.id, queue);
+            // Queue mutations run under the guild lock so two near-simultaneous .play
+            // commands can't both see playing=false and clobber each other's track.
+            await withGuildLock(message.guild.id, async () => {
+                let queue = queues.get(message.guild.id);
+                if (!queue) {
+                    queue = createQueue(message.guild.id);
+                    queue.textChannel = message.channel;
+                    queue.voiceChannel = message.member.voice.channel;
+                    queues.set(message.guild.id, queue);
 
-                try {
-                    queue.player = await shoukaku.joinVoiceChannel({
-                        guildId: message.guild.id,
-                        channelId: message.member.voice.channel.id,
-                        shardId: 0
-                    });
-
-                    logInfo('Connected to voice channel: ' + message.member.voice.channel.name);
-
-                    queue.player.on('start', () => {
-                        logInfo('Track started');
-                    });
-
-                    queue.player.on('end', async (data) => {
-                        const reason = data && data.reason;
-                        logInfo('Track ended' + (reason ? ' (reason: ' + reason + ')' : ''));
-                        if (reason === 'replaced') return;
-                        try { await playNext(message.guild.id); } catch (e) { logError('playNext error: ' + e); }
-                    });
-
-                    queue.player.on('exception', (data) => {
-                        logError('Track exception: ' + JSON.stringify(data));
-                        queue.textChannel.send('❌ An error occurred while playing!').catch(() => {});
-                        playNext(message.guild.id).catch(e => logError('playNext error: ' + e));
-                    });
-
-                    queue.player.on('stuck', (data) => {
-                        logError('Track stuck: ' + JSON.stringify(data));
-                        queue.textChannel.send('❌ Track stuck, skipping...').catch(() => {});
-                        playNext(message.guild.id).catch(e => logError('playNext error: ' + e));
-                    });
-
-                } catch (error) {
-                    logError('Error joining voice channel: ' + (error && error.stack ? error.stack : error));
-                    queues.delete(message.guild.id);
-                    return placeholder.edit('❌ Could not join voice channel!');
+                    try {
+                        queue.player = await shoukaku.joinVoiceChannel({
+                            guildId: message.guild.id,
+                            channelId: message.member.voice.channel.id,
+                            shardId: 0
+                        });
+                        logInfo('Connected to voice channel: ' + message.member.voice.channel.name);
+                        attachPlayerEvents(message.guild.id, queue);
+                    } catch (error) {
+                        logError('Error joining voice channel: ' + (error && error.stack ? error.stack : error));
+                        queues.delete(message.guild.id);
+                        await placeholder.edit('❌ Could not join voice channel!');
+                        return;
+                    }
                 }
-            }
 
-            if (queue.playing) {
-                queue.songs.push(song);
-                const embed = createSongEmbed(song, '📝 Added to Queue');
-                embed.addFields({ name: '🔢 Position', value: '`' + queue.songs.length + '`', inline: true });
-                cancelDisconnect(message.guild.id);
-                return placeholder.edit({ content: null, embeds: [embed] });
-            }
+                if (queue.playing) {
+                    queue.songs.push(song);
+                    const embed = createSongEmbed(song, '📝 Added to Queue');
+                    embed.addFields({ name: '🔢 Position', value: '`' + queue.songs.length + '`', inline: true });
+                    cancelDisconnect(message.guild.id);
+                    await placeholder.edit({ content: null, embeds: [embed] });
+                    return;
+                }
 
-            await playSong(message.guild.id, song);
-            // playSong sends its own "Now Playing" embed; replace the placeholder with a Now Playing summary too.
-            try {
-                const npEmbed = createSongEmbed(song, '🎵 Now Playing');
-                await placeholder.edit({ content: null, embeds: [npEmbed] });
-            } catch (_) { /* placeholder may already be irrelevant */ }
+                // playSong's announcement is suppressed; the placeholder edit below is
+                // the single "Now Playing" message for the first track.
+                await playSong(message.guild.id, song, true);
+                try {
+                    await placeholder.edit({ content: null, embeds: [buildNowPlayingEmbed(song)] });
+                } catch (_) { /* placeholder may already be irrelevant */ }
+            });
 
         } catch (error) {
             logError('Play command error: ' + (error && error.stack ? error.stack : error));
@@ -822,7 +928,7 @@ client.on('messageCreate', async (message) => {
             const startTime = parseTimeString(startTimeStr);
             const duration = parseTimeString(durationStr);
 
-            const node = [...shoukaku.nodes.values()].find(node => node.state === 1);
+            const node = [...shoukaku.nodes.values()].find(node => node.state === State.CONNECTED);
             if (!node) {
                 return placeholder.edit('❌ Lavalink node is not connected!');
             }
@@ -847,46 +953,41 @@ client.on('messageCreate', async (message) => {
                 videoId: ytInfo.videoId
             };
 
-            let queue = queues.get(message.guild.id);
-            if (!queue) {
-                queue = createQueue(message.guild.id);
-                queue.textChannel = message.channel;
-                queue.voiceChannel = message.member.voice.channel;
-                queues.set(message.guild.id, queue);
+            await withGuildLock(message.guild.id, async () => {
+                let queue = queues.get(message.guild.id);
+                if (!queue) {
+                    queue = createQueue(message.guild.id);
+                    queue.textChannel = message.channel;
+                    queue.voiceChannel = message.member.voice.channel;
+                    queues.set(message.guild.id, queue);
 
-                try {
-                    queue.player = await shoukaku.joinVoiceChannel({
-                        guildId: message.guild.id,
-                        channelId: message.member.voice.channel.id,
-                        shardId: 0
-                    });
-
-                    queue.player.on('start', () => logInfo('Track started'));
-                    queue.player.on('end', async (data) => {
-                        if (data && data.reason === 'replaced') return;
-                        try { await playNext(message.guild.id); } catch (e) { logError('playNext error: ' + e); }
-                    });
-                    queue.player.on('exception', (data) => {
-                        logError('Track exception: ' + JSON.stringify(data));
-                        queue.textChannel.send('❌ An error occurred!').catch(() => {});
-                        playNext(message.guild.id).catch(e => logError('playNext error: ' + e));
-                    });
-
-                } catch (error) {
-                    logError('Error joining voice channel: ' + (error && error.stack ? error.stack : error));
-                    queues.delete(message.guild.id);
-                    return placeholder.edit('❌ Could not join voice channel!');
+                    try {
+                        queue.player = await shoukaku.joinVoiceChannel({
+                            guildId: message.guild.id,
+                            channelId: message.member.voice.channel.id,
+                            shardId: 0
+                        });
+                        attachPlayerEvents(message.guild.id, queue);
+                    } catch (error) {
+                        logError('Error joining voice channel: ' + (error && error.stack ? error.stack : error));
+                        queues.delete(message.guild.id);
+                        await placeholder.edit('❌ Could not join voice channel!');
+                        return;
+                    }
                 }
-            }
 
-            if (queue.playing) {
-                queue.songs.push(song);
-                cancelDisconnect(message.guild.id);
-                return placeholder.edit('📝 Added to queue!');
-            }
+                if (queue.playing) {
+                    queue.songs.push(song);
+                    cancelDisconnect(message.guild.id);
+                    await placeholder.edit('📝 Added to queue!');
+                    return;
+                }
 
-            await playSong(message.guild.id, song);
-            try { await placeholder.edit('🎵 Now Playing!'); } catch (_) {}
+                await playSong(message.guild.id, song, true);
+                try {
+                    await placeholder.edit({ content: null, embeds: [buildNowPlayingEmbed(song)] });
+                } catch (_) {}
+            });
 
         } catch (error) {
             logError('Error in playfrom command: ' + (error && error.stack ? error.stack : error));
@@ -900,6 +1001,13 @@ client.on('messageCreate', async (message) => {
         if (!queue || !queue.playing) {
             return message.reply('❌ Nothing is playing!');
         }
+        // Advance even when loop is on -- replaying the track you just skipped is never
+        // what anyone means by "skip". Loop stays enabled for the next track.
+        queue.skipNext = true;
+        if (queue.paused) {
+            queue.paused = false;
+            try { await queue.player.setPaused(false); } catch (_) {}
+        }
         await message.reply('⏭️ Skipped!');
         queue.player.stopTrack();
     }
@@ -910,13 +1018,101 @@ client.on('messageCreate', async (message) => {
         if (!queue) {
             return message.reply('❌ Nothing is playing!');
         }
+        releaseQueueFiles(queue);
         queue.songs = [];
         queue.loop = false;
         queue.loopQueue = false;
         queue.playing = false;
+        queue.paused = false;
+        queue.currentSong = null;
         if (queue.player) queue.player.stopTrack();
         scheduleDisconnect(message.guild.id);
         await message.reply('⏹️ Stopped and cleared queue!');
+    }
+
+    // Pause / resume commands
+    if (command === 'pause') {
+        const queue = queues.get(message.guild.id);
+        if (!queue || !queue.playing) {
+            return message.reply('❌ Nothing is playing!');
+        }
+        if (queue.paused) {
+            return message.reply('⏸️ Already paused! Use `.resume` to continue.');
+        }
+        await queue.player.setPaused(true);
+        queue.paused = true;
+        await message.reply('⏸️ Paused! Use `.resume` to continue.');
+    }
+
+    if (command === 'resume' || command === 'unpause') {
+        const queue = queues.get(message.guild.id);
+        if (!queue || !queue.playing) {
+            return message.reply('❌ Nothing is playing!');
+        }
+        if (!queue.paused) {
+            return message.reply('▶️ Not paused!');
+        }
+        await queue.player.setPaused(false);
+        queue.paused = false;
+        await message.reply('▶️ Resumed!');
+    }
+
+    // Volume command (0-150, Lavalink treats 100 as unity gain)
+    if (command === 'volume' || command === 'vol') {
+        const queue = queues.get(message.guild.id);
+        if (!queue || !queue.player) {
+            return message.reply('❌ Nothing is playing!');
+        }
+        const vol = parseInt(args[0], 10);
+        if (isNaN(vol) || vol < 0 || vol > 150) {
+            return message.reply('❌ Usage: `.volume <0-150>` (100 = normal)');
+        }
+        await queue.player.setGlobalVolume(vol);
+        await message.reply('🔊 Volume set to `' + vol + '`');
+    }
+
+    // Now playing command with live position
+    if (command === 'np' || command === 'nowplaying') {
+        const queue = queues.get(message.guild.id);
+        if (!queue || !queue.playing || !queue.currentSong) {
+            return message.reply('❌ Nothing is playing!');
+        }
+        const song = queue.currentSong;
+        const pos = Math.min(queue.player.position || 0, song.length || 0);
+        const barLen = 20;
+        const filled = song.length ? Math.round((pos / song.length) * barLen) : 0;
+        const bar = '▬'.repeat(filled) + '🔘' + '▬'.repeat(Math.max(0, barLen - filled));
+        const embed = createSongEmbed(song, queue.paused ? '⏸️ Now Playing (paused)' : '🎵 Now Playing')
+            .addFields({ name: '📍 Position', value: bar + '\n`' + formatTime(pos) + ' / ' + formatTime(song.length) + '`' });
+        await message.reply({ embeds: [embed] });
+    }
+
+    // Shuffle command
+    if (command === 'shuffle') {
+        const queue = queues.get(message.guild.id);
+        if (!queue || queue.songs.length < 2) {
+            return message.reply('❌ Need at least 2 queued songs to shuffle!');
+        }
+        for (let i = queue.songs.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [queue.songs[i], queue.songs[j]] = [queue.songs[j], queue.songs[i]];
+        }
+        await message.reply('🔀 Queue shuffled! (' + queue.songs.length + ' songs)');
+    }
+
+    // Remove command
+    if (command === 'remove' || command === 'rm') {
+        const queue = queues.get(message.guild.id);
+        if (!queue || queue.songs.length === 0) {
+            return message.reply('❌ Queue is empty!');
+        }
+        const n = parseInt(args[0], 10);
+        if (isNaN(n) || n < 1 || n > queue.songs.length) {
+            return message.reply('❌ Usage: `.remove <1-' + queue.songs.length + '>` (see `.queue` for numbers)');
+        }
+        const [removed] = queue.songs.splice(n - 1, 1);
+        markFree(removed.localFile);
+        await message.reply('🗑️ Removed **' + removed.title + '** from the queue.');
     }
 
     // Queue command
@@ -995,6 +1191,7 @@ client.on('messageCreate', async (message) => {
         try {
             logInfo('Disconnecting from voice channel...');
             cancelDisconnect(message.guild.id);
+            releaseQueueFiles(queue);
             if (queue.player) queue.player.stopTrack();
             shoukaku.leaveVoiceChannel(message.guild.id);
             if (message.guild.members.me.voice.channel) {

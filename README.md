@@ -4,7 +4,7 @@ Music bot for Discord running on a Raspberry Pi. This is the current version of 
 
 ## Stack
 
-- Node.js 18 + discord.js 14
+- Node.js 22 + discord.js 14
 - Shoukaku 4.2 (Lavalink client)
 - Lavalink 4.2.2 (grab the jar from their GitHub releases, not included here)
 - yt-dlp nightly + deno (deno is needed for PO token solving, YouTube requires it now)
@@ -15,6 +15,10 @@ Music bot for Discord running on a Raspberry Pi. This is the current version of 
 npm install
 cp .env.example .env     # put your bot token in here
 ```
+
+The only required env var is `DISCORD_TOKEN`. Paths and the Lavalink connection are
+overridable if your layout differs: `YTDLP_PATH`, `AUDIO_CACHE_DIR`, `COOKIES_PATH`,
+`DENO_BIN_DIR`, `LAVALINK_URL`, `LAVALINK_PASSWORD`, `BOT_PREFIX`.
 
 Drop `Lavalink.jar` into `lavalink/` next to `application.yml`, then start Lavalink first and the bot second. On the Pi both run under systemd, unit files are in `deploy/`. The bot unit waits for Lavalink's /version endpoint before starting so boot order sorts itself out.
 
@@ -33,9 +37,14 @@ Two patches have to be reapplied to `node_modules/shoukaku/dist/index.js` after 
 |---------|--------------|
 | `.play <song/URL>` | Play music |
 | `.playfrom <url> <start> <duration>` | Play from a timestamp |
-| `.skip` | Skip current song |
+| `.pause` / `.resume` | Pause and resume playback |
+| `.skip` | Skip current song (works even with loop on) |
 | `.stop` | Stop and clear the queue |
 | `.queue` / `.q` | Show the queue |
+| `.np` | Now playing, with position bar |
+| `.volume <0-150>` / `.vol` | Set volume (100 = normal) |
+| `.shuffle` | Shuffle the queue |
+| `.remove <n>` / `.rm` | Remove song n from the queue |
 | `.clear` | Clear queue, keeps current song playing |
 | `.loop` | Loop current song |
 | `.loopqueue` / `.lq` | Loop the whole queue |
@@ -44,7 +53,9 @@ Two patches have to be reapplied to `node_modules/shoukaku/dist/index.js` after 
 
 ## Notes
 
-- Downloaded audio is cached in `audio_cache/`, keeps the last 20 files, cleans itself
+- If Lavalink stays down for 3 minutes the bot exits on purpose and systemd restarts the whole stack. Not a bug.
+- `deploy/ytdlp-update.timer` updates yt-dlp weekly (Mondays 5am) so YouTube breakage fixes itself
+- Downloaded audio is cached in `audio_cache/`, keeps the last 20 files (max 500 MB), cleans itself
 - An optional `cookies.txt` (Firefox export, NOT Edge) lets it play age-restricted stuff. Don't commit it.
 - If every video suddenly only returns storyboard formats, yt-dlp stable has rotted again. Move to nightly: `pip3 install --break-system-packages --upgrade --pre 'yt-dlp[default]'`
 
