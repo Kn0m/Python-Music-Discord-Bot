@@ -451,12 +451,8 @@ function buildNowPlayingEmbed(song) {
     if (song.startTime) {
         return new EmbedBuilder()
             .setTitle('🎵 Now Playing')
-            .setDescription('**[' + song.title + '](' + song.uri + ')**')
-            .addFields([
-                { name: '⏰ Starting at', value: '`' + formatTime(song.startTime) + '`', inline: true },
-                { name: '⏱️ Playing for', value: '`' + formatTime(song.duration) + '`', inline: true },
-                { name: '👤 Requested by', value: song.requestedBy, inline: true }
-            ])
+            .setDescription('**[' + song.title + '](' + song.uri + ')**\n' +
+                '`' + formatTime(song.duration) + '` from `' + formatTime(song.startTime) + '` · requested by ' + song.requestedBy)
             .setThumbnail(song.thumbnail)
             .setColor('#FF0000')
             .setFooter({ text: 'Powered by Lavalink + yt-dlp' })
@@ -468,11 +464,8 @@ function buildNowPlayingEmbed(song) {
 function createSongEmbed(song, title) {
     return new EmbedBuilder()
         .setTitle(title)
-        .setDescription('**[' + song.title + '](' + song.uri + ')**')
-        .addFields([
-            { name: '⏰ Duration', value: '`' + formatTime(song.length) + '`', inline: true },
-            { name: '👤 Requested by', value: song.requestedBy, inline: true }
-        ])
+        .setDescription('**[' + song.title + '](' + song.uri + ')**\n' +
+            '`' + formatTime(song.length) + '` · requested by ' + song.requestedBy)
         .setThumbnail(song.thumbnail)
         .setColor('#FF0000')
         .setFooter({ text: 'Powered by Lavalink + yt-dlp' })
@@ -1082,8 +1075,8 @@ client.on('messageCreate', async (message) => {
         const barLen = 20;
         const filled = song.length ? Math.round((pos / song.length) * barLen) : 0;
         const bar = '▬'.repeat(filled) + '🔘' + '▬'.repeat(Math.max(0, barLen - filled));
-        const embed = createSongEmbed(song, queue.paused ? '⏸️ Now Playing (paused)' : '🎵 Now Playing')
-            .addFields({ name: '📍 Position', value: bar + '\n`' + formatTime(pos) + ' / ' + formatTime(song.length) + '`' });
+        const embed = createSongEmbed(song, queue.paused ? '⏸️ Now Playing (paused)' : '🎵 Now Playing');
+        embed.setDescription(embed.data.description + '\n\n' + bar + '\n`' + formatTime(pos) + ' / ' + formatTime(song.length) + '`');
         await message.reply({ embeds: [embed] });
     }
 
