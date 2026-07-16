@@ -22,8 +22,9 @@ const COOKIES_PATH = process.env.COOKIES_PATH || '/home/m0nk/Discord-Music-Bot/c
 const DENO_BIN_DIR = process.env.DENO_BIN_DIR || '/home/m0nk/.deno/bin';
 
 // Timeouts and intervals (named constants)
-const YTDLP_META_TIMEOUT_MS = 30000;
-const YTDLP_DL_TIMEOUT_MS = 60000;
+// Single-call budget: one yt-dlp run does extraction (~10-15s on the Pi) AND download.
+// (Replaced the old 30s metadata + 60s download split when the two calls were merged.)
+const YTDLP_TIMEOUT_MS = 90000;
 const IDLE_TIMEOUT = 60000;
 const CACHE_CLEAN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const CACHE_MAX_FILES = 20;
@@ -36,7 +37,10 @@ const LAVALINK_DEAD_EXIT_MS = 3 * 60 * 1000;
 // Includes default (android_vr, web_safari), then a curated set of known-good fallbacks.
 // Even if none of these rescue COPPA "Made for Kids" content, they meaningfully improve
 // resilience to YouTube's regular client-rotation breakage.
-const YTDLP_PLAYER_CLIENTS = 'default,tv,mweb,web_embedded';
+// Each extra player client costs ~1s per call on the Pi. The trimmed default covers the
+// common cases; if YouTube breaks a client again, restore the old robust set via env:
+//   YTDLP_PLAYER_CLIENTS=default,tv,mweb,web_embedded
+const YTDLP_PLAYER_CLIENTS = process.env.YTDLP_PLAYER_CLIENTS || 'default,tv';
 
 // Lavalink configuration
 const LavalinkConfig = [
@@ -170,23 +174,57 @@ async function runYtDlp(args, timeoutMs) {
     }
 }
 
-// Best-effort cleanup of leftover yt-dlp partials/postproc remnants for a given id.
-function cleanupPartials(safeTitle) {
+// Audio container extensions the bot treats as playable cache artifacts. Lavalink's local
+// source plays all of these natively -- no transcode step needed. (.opus entries are
+// legacy from the pre-2026-07-15 flow that re-encoded; still perfectly playable.)
+const AUDIO_EXTS = ['.opus', '.webm', '.m4a', '.mp3'];
+
+function findCachedAudio(safeId) {
+    for (const ext of AUDIO_EXTS) {
+        const p = path.join(AUDIO_CACHE, safeId + ext);
+        try {
+            const st = fs.statSync(p);
+            if (st.isFile() && st.size > 1024) return p;
+        } catch (_) {}
+    }
+    return null;
+}
+
+// Extract a YouTube video id from a direct URL (watch?v=, youtu.be/, shorts/, embed/).
+// Returns null for searches and anything ambiguous.
+function extractYouTubeId(query) {
+    if (!query || !query.includes('http')) return null;
+    const m = query.match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+    return m ? m[1] : null;
+}
+
+// Best-effort cleanup of leftover yt-dlp temp files for a given temp prefix. Only ever
+// called with tmp- prefixes (after the produced file has been renamed away, or on
+// failure), so everything matching is junk.
+function cleanupPartials(tempPrefix) {
     try {
         const entries = fs.readdirSync(AUDIO_CACHE);
         for (const f of entries) {
-            if (!f.startsWith(safeTitle + '.')) continue;
-            // Keep .opus (the success artifact); sweep everything else (.webm, .m4a, .part, .ytdl).
-            if (f.endsWith('.opus')) continue;
+            if (!f.startsWith(tempPrefix + '.')) continue;
             try { fs.unlinkSync(path.join(AUDIO_CACHE, f)); } catch (_) {}
         }
     } catch (_) {}
 }
 
 // Resolve a query (URL or search) via yt-dlp. Returns:
-//   { ok: true, title, uri, length, thumbnail, localFile, author }
+//   { ok: true, title, uri, length, thumbnail, localFile, author, videoId }
 //   { ok: false, reason }
-// Two near-simultaneous calls for the same video id share one in-flight download via
+//
+// Single-call design (2026-07-15): one yt-dlp invocation both prints the metadata JSON
+// (--print '%()j' --no-simulate) and downloads the audio. The old two-call flow paid
+// yt-dlp's ~10-15s startup+extraction cost twice per song (~32s to first note on the Pi).
+// Audio stays in its native container (.webm/.m4a) -- Lavalink plays those directly, and
+// the old "-x --audio-format opus" step re-encoded opus to opus (~3s of pure overhead).
+//
+// Cached-replay shortcut: a direct video URL whose audio + .json metadata sidecar are both
+// cached returns instantly with zero yt-dlp invocations (queue loops, repeated .play URLs).
+//
+// Near-simultaneous calls for the same video/query share one in-flight download via
 // inflightDownloads map (deduplication).
 async function resolveYtDlp(query) {
     // Accept full URLs and yt-dlp search prefixes (ytsearch:, ytsearchdate:, ytsearchdateN:) as-is.
@@ -194,114 +232,135 @@ async function resolveYtDlp(query) {
     const searchQuery = (query.includes('http') || isPrefixed) ? query : 'ytsearch:' + query;
 
     // For multi-result queries (YouTube search-results pages used by .news), take only the
-    // first hit. Filtering by duration/is_live would require fetching multiple results, which
-    // routinely exceeds the 30s metadata timeout. If the first hit happens to be a livestream
-    // replay, the download step's 60s timeout aborts it and the user can retry.
+    // first hit. Filtering by duration/is_live would require fetching multiple results,
+    // which routinely blows the time budget. If the first hit happens to be a livestream
+    // replay, the run's timeout aborts it and the user can retry.
     const isSearchListing = /youtube\.com\/results\?/i.test(searchQuery);
     const listingArgs = isSearchListing ? ['--playlist-end', '1'] : [];
 
-    // Step 1: metadata fetch with -j (single JSON line on stdout).
-    const metaArgs = [
-        '--js-runtimes', 'deno',
-        '--remote-components', 'ejs:github',
-        ...cookieArgs(),
-        '--extractor-args', 'youtube:player_client=' + YTDLP_PLAYER_CLIENTS,
-        '-f', 'bestaudio',
-        '--no-warnings', '--no-playlist', '-j',
-        ...listingArgs,
-        searchQuery
-    ];
-    const metaRes = await runYtDlp(metaArgs, YTDLP_META_TIMEOUT_MS);
-    if (!metaRes.ok) {
-        return { ok: false, reason: metaRes.reason };
-    }
-
-    let info;
-    try {
-        // For ytsearch: the first match is on stdout; -j outputs one JSON object per line
-        const firstLine = metaRes.stdout.split('\n').find(l => l.trim().startsWith('{'));
-        if (!firstLine) return { ok: false, reason: 'yt-dlp returned no JSON metadata' };
-        info = JSON.parse(firstLine);
-    } catch (e) {
-        return { ok: false, reason: 'failed to parse yt-dlp metadata: ' + e.message };
-    }
-
-    const safeTitle = (info.id || 'audio').replace(/[^a-zA-Z0-9_-]/g, '_');
-    const finalPath = path.join(AUDIO_CACHE, safeTitle + '.opus');
-
-    // Build the result that all callers will share.
-    const buildResult = (localFile) => ({
-        ok: true,
-        title: info.title || 'Unknown',
-        uri: info.webpage_url || query,
-        length: (info.duration || 0) * 1000,
-        thumbnail: info.thumbnail || 'https://i.imgur.com/qFIXWtN.png',
-        localFile: localFile,
-        author: info.uploader || 'Unknown',
-        videoId: safeTitle
-    });
-
-    // Fast-path: file already cached and non-empty -- skip download entirely.
-    try {
-        const st = fs.statSync(finalPath);
-        if (st.isFile() && st.size > 1024) {
-            logInfo('Cache hit: ' + finalPath);
-            return buildResult(finalPath);
+    // Cached-replay shortcut: for direct video URLs the id is knowable without yt-dlp.
+    const directId = extractYouTubeId(query);
+    if (directId) {
+        const safeId = directId.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const cachedAudio = findCachedAudio(safeId);
+        if (cachedAudio) {
+            try {
+                const meta = JSON.parse(fs.readFileSync(path.join(AUDIO_CACHE, safeId + '.json'), 'utf-8'));
+                logInfo('Cache hit (no yt-dlp needed): ' + cachedAudio);
+                return {
+                    ok: true,
+                    title: meta.title || 'Unknown',
+                    uri: meta.uri || query,
+                    length: meta.length || 0,
+                    thumbnail: meta.thumbnail || 'https://i.imgur.com/qFIXWtN.png',
+                    localFile: cachedAudio,
+                    author: meta.author || 'Unknown',
+                    videoId: safeId
+                };
+            } catch (_) { /* sidecar missing/corrupt -> full resolve below (rewrites it) */ }
         }
-    } catch (_) { /* not cached, fall through */ }
+    }
 
-    // Step 2: deduplicate simultaneous downloads of the same id.
-    if (inflightDownloads.has(safeTitle)) {
-        logInfo('Joining in-flight download for ' + safeTitle);
+    // Deduplicate simultaneous resolves. For direct URLs the video id is the key; for
+    // searches the normalized query text is the best key available pre-resolution.
+    const dedupeKey = directId || searchQuery.toLowerCase();
+    if (inflightDownloads.has(dedupeKey)) {
+        logInfo('Joining in-flight resolve for ' + dedupeKey);
         try {
-            return await inflightDownloads.get(safeTitle);
+            return await inflightDownloads.get(dedupeKey);
         } catch (e) {
-            // Fall through and try our own download attempt
+            // Fall through and try our own attempt
         }
     }
 
     const downloadPromise = (async () => {
         // Download to a temp filename, then rename atomically into place. This prevents
         // two concurrent downloads from racing on the same final path.
-        const tempBase = safeTitle + '.tmp-' + process.pid + '-' + Date.now();
+        const tempBase = (directId || 'q').replace(/[^a-zA-Z0-9_-]/g, '_') + '.tmp-' + process.pid + '-' + Date.now();
         const tempOutputPattern = path.join(AUDIO_CACHE, tempBase + '.%(ext)s');
-        // For search-URL queries we already picked a specific video id during meta-fetch,
-        // so download by id directly. This avoids re-running the search (and re-paying its
-        // race risk of yt-dlp picking a different first result on the second call).
-        const dlTarget = isSearchListing && info.id
-            ? 'https://www.youtube.com/watch?v=' + info.id
-            : searchQuery;
-        const dlArgs = [
+        const args = [
             '--js-runtimes', 'deno',
             '--remote-components', 'ejs:github',
             ...cookieArgs(),
             '--extractor-args', 'youtube:player_client=' + YTDLP_PLAYER_CLIENTS,
-            '-f', 'bestaudio', '-x', '--audio-format', 'opus',
+            '-f', 'bestaudio',
             '--no-warnings', '--no-playlist',
+            // --print implies quiet; --no-simulate re-enables the download. Net effect:
+            // stdout carries exactly one JSON line (the full info dict) per video.
+            '--print', '%()j', '--no-simulate',
+            ...listingArgs,
             '-o', tempOutputPattern,
-            dlTarget
+            searchQuery
         ];
-        const dlRes = await runYtDlp(dlArgs, YTDLP_DL_TIMEOUT_MS);
-        if (!dlRes.ok) {
-            cleanupPartials(tempBase); // sweep any partial .webm/.part
-            return { ok: false, reason: dlRes.reason };
+        const res = await runYtDlp(args, YTDLP_TIMEOUT_MS);
+        if (!res.ok) {
+            cleanupPartials(tempBase);
+            return { ok: false, reason: res.reason };
         }
 
-        // Find the produced file (should be tempBase.opus).
+        let info;
+        try {
+            const firstLine = res.stdout.split('\n').find(l => l.trim().startsWith('{'));
+            if (!firstLine) return { ok: false, reason: 'yt-dlp returned no JSON metadata' };
+            info = JSON.parse(firstLine);
+        } catch (e) {
+            cleanupPartials(tempBase);
+            return { ok: false, reason: 'failed to parse yt-dlp metadata: ' + e.message };
+        }
+
+        const safeTitle = (info.id || 'audio').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+        const buildResult = (localFile) => ({
+            ok: true,
+            title: info.title || 'Unknown',
+            uri: info.webpage_url || query,
+            length: (info.duration || 0) * 1000,
+            thumbnail: info.thumbnail || 'https://i.imgur.com/qFIXWtN.png',
+            localFile: localFile,
+            author: info.uploader || 'Unknown',
+            videoId: safeTitle
+        });
+
+        // Best-effort metadata sidecar so future direct-URL replays skip yt-dlp entirely.
+        const writeSidecar = () => {
+            try {
+                fs.writeFileSync(path.join(AUDIO_CACHE, safeTitle + '.json'), JSON.stringify({
+                    title: info.title || 'Unknown',
+                    uri: info.webpage_url || query,
+                    length: (info.duration || 0) * 1000,
+                    thumbnail: info.thumbnail || null,
+                    author: info.uploader || 'Unknown'
+                }));
+            } catch (_) {}
+        };
+
+        // Find the produced file (native container: .webm usually, sometimes .m4a).
         let producedFile = null;
         try {
             const candidates = fs.readdirSync(AUDIO_CACHE).filter(f => f.startsWith(tempBase + '.'));
-            const opusFile = candidates.find(f => f.endsWith('.opus'));
-            if (opusFile) producedFile = path.join(AUDIO_CACHE, opusFile);
+            const audioFile = candidates.find(f => AUDIO_EXTS.some(e => f.endsWith(e)));
+            if (audioFile) producedFile = path.join(AUDIO_CACHE, audioFile);
         } catch (_) {}
 
         if (!producedFile) {
             cleanupPartials(tempBase);
-            return { ok: false, reason: 'yt-dlp succeeded but produced no .opus file' };
+            return { ok: false, reason: 'yt-dlp succeeded but produced no audio file' };
+        }
+
+        // If this id is already cached (e.g. a search resolved to a previously-played video,
+        // possibly under a different extension from the old flow), keep the existing file.
+        const existing = findCachedAudio(safeTitle);
+        if (existing) {
+            try { fs.unlinkSync(producedFile); } catch (_) {}
+            cleanupPartials(tempBase);
+            writeSidecar();
+            logInfo('Cache hit (id known post-resolve): ' + existing);
+            return buildResult(existing);
         }
 
         // Rename into the final canonical path. If another concurrent download already won,
         // unlink ours and use theirs.
+        const finalPath = path.join(AUDIO_CACHE, safeTitle + path.extname(producedFile));
         try {
             if (fs.existsSync(finalPath)) {
                 try { fs.unlinkSync(producedFile); } catch (_) {}
@@ -314,17 +373,16 @@ async function resolveYtDlp(query) {
             return { ok: false, reason: 'failed to finalize cached file: ' + e.message };
         }
 
-        // Sweep any leftover non-opus remnants (postproc partials).
         cleanupPartials(tempBase);
-
+        writeSidecar();
         return buildResult(finalPath);
     })();
 
-    inflightDownloads.set(safeTitle, downloadPromise);
+    inflightDownloads.set(dedupeKey, downloadPromise);
     try {
         return await downloadPromise;
     } finally {
-        inflightDownloads.delete(safeTitle);
+        inflightDownloads.delete(dedupeKey);
     }
 }
 
@@ -348,10 +406,12 @@ function releaseQueueFiles(queue) {
 function cleanAudioCache() {
     try {
         const entries = fs.readdirSync(AUDIO_CACHE);
-        // Sweep junk (non-opus, non-mp3) artifacts left behind by failed yt-dlp postproc.
+        // Sweep junk left behind by failed downloads. Real artifacts are audio files in
+        // AUDIO_EXTS plus .json metadata sidecars; anything with a .tmp- marker or a
+        // partial-download extension is junk if it's not in-use.
         for (const f of entries) {
-            if (f.endsWith('.opus') || f.endsWith('.mp3')) continue;
-            // .webm, .m4a, .part, .ytdl, .tmp-*.opus etc. are all junk if they're not in-use.
+            const isArtifact = (AUDIO_EXTS.some(e => f.endsWith(e)) || f.endsWith('.json')) && !f.includes('.tmp-');
+            if (isArtifact) continue;
             const full = path.join(AUDIO_CACHE, f);
             if (inUseFiles.has(full)) continue;
             try { fs.unlinkSync(full); } catch (_) {}
@@ -366,7 +426,10 @@ function cleanAudioCache() {
             }
         }
 
+        // Only audio files count toward the caps; .json sidecars are ~1 KB and are swept
+        // below when their audio partner goes away.
         const remaining = fs.readdirSync(AUDIO_CACHE)
+            .filter(f => AUDIO_EXTS.some(e => f.endsWith(e)))
             .map(f => {
                 const full = path.join(AUDIO_CACHE, f);
                 const st = fs.statSync(full);
@@ -386,6 +449,18 @@ function cleanAudioCache() {
                 keptBytes += size;
             } else {
                 try { fs.unlinkSync(f.full); } catch (_) {}
+            }
+        }
+
+        // Sweep orphaned .json sidecars (audio partner deleted above or never existed).
+        for (const f of fs.readdirSync(AUDIO_CACHE)) {
+            if (!f.endsWith('.json')) continue;
+            const base = f.slice(0, -5);
+            const hasAudio = AUDIO_EXTS.some(e => {
+                try { return fs.statSync(path.join(AUDIO_CACHE, base + e)).isFile(); } catch (_) { return false; }
+            });
+            if (!hasAudio) {
+                try { fs.unlinkSync(path.join(AUDIO_CACHE, f)); } catch (_) {}
             }
         }
     } catch (e) {
